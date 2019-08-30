@@ -107,8 +107,8 @@ Status ReductionHelper::Simplify(const Tensor& data, const Tensor& axis,
   for (; dim_index < data.dims(); ++dim_index) {
     if (data.dim_size(dim_index) != 1) break;
   }
-  if (dim_index >= data.dims()) {
-    // Special case. The input is essentially a scalar.
+  if (dim_index >= data.dims() || (data.dims() && data.dim_size(0) == 0)) {
+    // Special case. The input is essentially a scalar or [].
     reduce_first_axis_ = true;
   } else {
     // Starting from the (dim_index)-th dimension, dimensions
