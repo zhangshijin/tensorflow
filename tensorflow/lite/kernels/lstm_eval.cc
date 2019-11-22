@@ -17,6 +17,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 
+#include "tensorflow/lite/kernels/cpu_backend_context.h"
 #include "tensorflow/lite/kernels/internal/compatibility.h"
 
 #ifdef GEMMLOWP_PROFILING
@@ -37,11 +38,6 @@ namespace builtin {
 namespace lstm_eval {
 
 namespace {
-
-// Small float to avoid divergence during calculation of deviation for layer
-// norm lstm.
-const float kLayerNormEpsilon = 1e-8;
-
 // Performs an LSTM batch inference step for input specified by input_ptr_batch.
 // The LSTM cell is specified by the pointers to its weights (*_weights_ptr) and
 // biases (*_bias_ptr), and buffers (*_scratch), along with additional
@@ -223,9 +219,8 @@ inline void LstmStepWithAuxInput(
           input_gate_scratch);
     }
     if (is_layer_norm_lstm) {
-      tensor_utils::MeanStddevNormalization(input_gate_scratch,
-                                            input_gate_scratch, n_cell, n_batch,
-                                            kLayerNormEpsilon);
+      tensor_utils::MeanStddevNormalization(
+          input_gate_scratch, input_gate_scratch, n_cell, n_batch);
       tensor_utils::VectorBatchVectorCwiseProduct(
           input_layer_norm_coefficients_ptr, n_cell, input_gate_scratch,
           n_batch, input_gate_scratch);
@@ -244,8 +239,7 @@ inline void LstmStepWithAuxInput(
   }
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(forget_gate_scratch,
-                                          forget_gate_scratch, n_cell, n_batch,
-                                          kLayerNormEpsilon);
+                                          forget_gate_scratch, n_cell, n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         forget_layer_norm_coefficients_ptr, n_cell, forget_gate_scratch,
         n_batch, forget_gate_scratch);
@@ -260,7 +254,7 @@ inline void LstmStepWithAuxInput(
                                          n_batch * n_cell, cell_state_ptr);
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(cell_scratch, cell_scratch, n_cell,
-                                          n_batch, kLayerNormEpsilon);
+                                          n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         cell_layer_norm_coefficients_ptr, n_cell, cell_scratch, n_batch,
         cell_scratch);
@@ -291,8 +285,7 @@ inline void LstmStepWithAuxInput(
   }
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(output_gate_scratch,
-                                          output_gate_scratch, n_cell, n_batch,
-                                          kLayerNormEpsilon);
+                                          output_gate_scratch, n_cell, n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         output_layer_norm_coefficients_ptr, n_cell, output_gate_scratch,
         n_batch, output_gate_scratch);
@@ -698,9 +691,8 @@ inline void LstmStepWithAuxInput(
           input_gate_scratch);
     }
     if (is_layer_norm_lstm) {
-      tensor_utils::MeanStddevNormalization(input_gate_scratch,
-                                            input_gate_scratch, n_cell, n_batch,
-                                            kLayerNormEpsilon);
+      tensor_utils::MeanStddevNormalization(
+          input_gate_scratch, input_gate_scratch, n_cell, n_batch);
       tensor_utils::VectorBatchVectorCwiseProduct(
           input_layer_norm_coefficients_ptr, n_cell, input_gate_scratch,
           n_batch, input_gate_scratch);
@@ -722,8 +714,7 @@ inline void LstmStepWithAuxInput(
   }
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(forget_gate_scratch,
-                                          forget_gate_scratch, n_cell, n_batch,
-                                          kLayerNormEpsilon);
+                                          forget_gate_scratch, n_cell, n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         forget_layer_norm_coefficients_ptr, n_cell, forget_gate_scratch,
         n_batch, forget_gate_scratch);
@@ -738,7 +729,7 @@ inline void LstmStepWithAuxInput(
                                          n_batch * n_cell, cell_state_ptr);
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(cell_scratch, cell_scratch, n_cell,
-                                          n_batch, kLayerNormEpsilon);
+                                          n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         cell_layer_norm_coefficients_ptr, n_cell, cell_scratch, n_batch,
         cell_scratch);
@@ -774,8 +765,7 @@ inline void LstmStepWithAuxInput(
   }
   if (is_layer_norm_lstm) {
     tensor_utils::MeanStddevNormalization(output_gate_scratch,
-                                          output_gate_scratch, n_cell, n_batch,
-                                          kLayerNormEpsilon);
+                                          output_gate_scratch, n_cell, n_batch);
     tensor_utils::VectorBatchVectorCwiseProduct(
         output_layer_norm_coefficients_ptr, n_cell, output_gate_scratch,
         n_batch, output_gate_scratch);
@@ -887,6 +877,97 @@ inline void LstmStepWithAuxInput(
   }
 }
 
+// Fully quantized lstm kernel. Currently supports both cifg and non-cifg.
+//
+// Input activatoin of size n_batch * n_input:
+//   input_ptr
+//
+// LSTM weights:
+// Quantized input weights of size 'n_cell * n_input':
+//   input_to_input_weight_ptr            - optional
+//   input_to_forget_weight_ptr           - optional
+//   input_to_cell_weight_ptr             - optional
+//   input_to_output_weight_ptr           - optional
+//
+// Quantized recurrent weights of size 'n_cell * n_output':
+//   recurrent_to_input_weight_ptr        - optional
+//   recurrent_to_forget_weights_ptr
+//   recurrent_to_cell_weights_ptr
+//   recurrent_to_input_weights_ptr
+//
+// Quantized peephole weights of size 'n_cell', representing diagonal matrices.
+//   cell_to_input_weights               - optional
+//   cell_to_cell_weights                - optional
+//   cell_to_output_weights              - optional
+//
+// Quantized projection weights of size 'n_output * n_cell'
+//   proj_weight_ptr                     - optional
+//
+// Weight scales (scalars) for each of the weights above.
+//   effective_input_to_input_scale_a    - optional
+//   effective_input_to_input_scale_b    - optional
+//   effective_input_to_forget_scale_a
+//   effective_input_to_forget_scale_b
+//   effective_input_to_cell_scale_a
+//   effective_input_to_cell_scale_b
+//   effective_input_to_output_scale_a
+//   effective_input_to_output_scale_b
+//   effective_recurrent_to_input_scale_a    - optional
+//   effective_recurrent_to_input_scale_b    - optional
+//   effective_recurrent_to_forget_scale_a
+//   effective_recurrent_to_forget_scale_b
+//   effective_recurrent_to_cell_scale_a
+//   effective_recurrent_to_cell_scale_b
+//   effective_recurrent_to_output_scale_a
+//   effective_recurrent_to_output_scale_b
+//   effective_proj_scale_a                  - optional
+//   effective_proj_scale_b                  - optional
+//
+// Gate biases of size 'n_cell':
+//   input_bias_ptr                 - optional
+//   forget_bias_ptr
+//   cell_bias_ptr
+//   output_bias_ptr
+//
+// Layer norm coefficients of size 'n_cell', representing diagonal matrices.
+//   layer_norm_input_weight_ptr    - optional
+//   layer_norm_forput_weight_ptr   - optional
+//   layer_norm_cell_weight_ptr     - optional
+//   layer_norm_output_weight_ptr   - optional
+//
+// Layer norm scales of size 'n_cell'.
+//   layer_norm_input_scale_a     - optional
+//   layer_norm_input_scale_b     - optional
+//   layer_norm_forget_scale_a    - optional
+//   layer_norm_forget_scale_b    - optional
+//   layer_norm_cell_scale_a      - optional
+//   layer_norm_cell_scale_b      - optional
+//   layer_norm_output_scale_a    - optional
+//   layer_norm_output_scale_b    - optional
+//
+// Scalar values:
+//   quantized_cell_clip: quantized clip value for cell.
+//   quantized_proj_clip: quantized clip value for projection.
+//   cell_scale: the POT scale for cell state.
+//
+// Zero points:
+//   activation_zp: zero point of activation
+//   hidden_zp: zero point for hidden state.
+//
+// Temporary pre-allocated storage for the calculation. Each is of size n_cell *
+// n_batch.
+//   scratch_0:
+//   scratch_1
+//   scratch_2
+//   scratch_3
+//   scratch_4
+//   scratch_5: this scratch buffer is created purely for optimizing the
+//              MatrixBatchVectorMultiplyAccumulate.
+//
+// Outputs:
+//   output_state_ptr - size 'n_batch * n_output'
+//   cell_state_ptr   - size 'n_batch * n_cell'
+//   output_ptr       - size 'n_batch * n_output'
 inline void LstmStepQuantized(
     const int8_t* input_ptr, const int8_t* input_to_input_weight_ptr,
     int32_t effective_input_to_input_scale_a,
@@ -934,57 +1015,62 @@ inline void LstmStepQuantized(
     int32_t layer_norm_output_scale_a, int32_t layer_norm_output_scale_b,
     const int32_t* input_bias_ptr, const int32_t* forget_bias_ptr,
     const int32_t* cell_bias_ptr, const int32_t* output_bias_ptr,
-    int32 quantized_cell_clip, int32 quantized_proj_clip,
+    int16_t quantized_cell_clip, int8_t quantized_proj_clip, int32_t cell_scale,
     const int32_t* inv_large_value,
-    const int32_t* input_to_forget_weight_x_input_zp,
-    const int32_t* recurrent_to_forget_weight_x_activation_zp,
-    const int32_t* input_to_cell_weight_x_input_zp,
-    const int32_t* recurrent_to_cell_weight_x_activation_zp,
-    const int32_t* input_to_output_weight_x_input_zp,
-    const int32_t* recurrent_to_output_weight_x_activation_zp,
-    const int32_t* input_to_input_weight_x_input_zp,
-    const int32_t* recurrent_to_input_weight_x_activation_zp,
-    const int32_t* projection_bias_accu, int32 n_batch, int32 n_cell,
+    const int32_t* input_to_forget_effective_bias,
+    const int32_t* recurrent_to_forget_effective_bias,
+    const int32_t* input_to_cell_effective_bias,
+    const int32_t* recurrent_to_cell_effective_bias,
+    const int32_t* input_to_output_effective_bias,
+    const int32_t* recurrent_to_output_effective_bias,
+    const int32_t* input_to_input_effective_bias,
+    const int32_t* recurrent_to_input_effective_bias,
+    const int32_t* projection_effective_bias, int32 n_batch, int32 n_cell,
     int32 n_input, int32 n_output, int32 output_batch_leading_dim,
     int8_t* activation_ptr, int32_t activation_zp, int16_t* cell_ptr,
     int8_t* output_ptr, int16_t* scratch_0_ptr, int16_t* scratch_1_ptr,
     int16_t* scratch_2_ptr, int16_t* scratch_3_ptr, int8_t* scratch_4_ptr,
-    int32_t* scratch_5_ptr) {
-  TFLITE_DCHECK(input_to_forget_weight_x_input_zp);
-  TFLITE_DCHECK(recurrent_to_forget_weight_x_activation_zp);
-  TFLITE_DCHECK(input_to_cell_weight_x_input_zp);
-  TFLITE_DCHECK(recurrent_to_cell_weight_x_activation_zp);
-  TFLITE_DCHECK(input_to_output_weight_x_input_zp);
-  TFLITE_DCHECK(recurrent_to_output_weight_x_activation_zp);
-  TFLITE_DCHECK(input_to_input_weight_x_input_zp);
-  TFLITE_DCHECK(recurrent_to_input_weight_x_activation_zp);
-  TFLITE_DCHECK(projection_bias_accu);
+    int32_t* scratch_5_ptr, CpuBackendContext* context) {
+  // Get hyper parameters.
+  const bool use_cifg = (input_to_input_weight_ptr == nullptr);
+
+  // Check for nullptrs.
+  TFLITE_DCHECK(input_to_forget_effective_bias);
+  TFLITE_DCHECK(recurrent_to_forget_effective_bias);
+  TFLITE_DCHECK(input_to_cell_effective_bias);
+  TFLITE_DCHECK(recurrent_to_cell_effective_bias);
+  TFLITE_DCHECK(input_to_output_effective_bias);
+  TFLITE_DCHECK(recurrent_to_output_effective_bias);
+  if (!use_cifg) {
+    TFLITE_DCHECK(input_to_input_effective_bias);
+    TFLITE_DCHECK(recurrent_to_input_effective_bias);
+  }
+  TFLITE_DCHECK(projection_effective_bias);
 
   // TODO(renjieliu): Handle optional arguments processing here:
-  // case cifg: input_to_input_weights should be nullptr
-  //            recurrent_to_input_weight should be nullptr
-  //            input_bias should be nullptr
   // case not peephole: cell_to_forget_weight should be nullptr
   //                    cell_to_output_weight should be nullptr
   //                    cifg: cell_to_input_weight should be nullptr
 
   // Set scratch to 0.
-  memset(scratch_0_ptr, 0, n_batch * n_cell * sizeof(int16_t));
+  if (!use_cifg) {
+    memset(scratch_0_ptr, 0, n_batch * n_cell * sizeof(int16_t));
+  }
   memset(scratch_1_ptr, 0, n_batch * n_cell * sizeof(int16_t));
   memset(scratch_2_ptr, 0, n_batch * n_cell * sizeof(int16_t));
   memset(scratch_3_ptr, 0, n_batch * n_cell * sizeof(int16_t));
 
   // Forget gate.
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      input_ptr, input_to_forget_weight_x_input_zp, input_to_forget_weight_ptr,
+      input_ptr, input_to_forget_effective_bias, input_to_forget_weight_ptr,
       effective_input_to_forget_scale_a, effective_input_to_forget_scale_b,
-      n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_1_ptr);
+      n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_1_ptr, context);
 
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      activation_ptr, recurrent_to_forget_weight_x_activation_zp,
+      activation_ptr, recurrent_to_forget_effective_bias,
       recurrent_to_forget_weight_ptr, effective_recurrent_to_forget_scale_a,
       effective_recurrent_to_forget_scale_b, n_batch, n_output, n_cell, 0,
-      scratch_5_ptr, scratch_1_ptr);
+      scratch_5_ptr, scratch_1_ptr, context);
 
   if (layer_norm_forget_weight_ptr != nullptr) {
     tensor_utils::ApplyLayerNorm(scratch_1_ptr, layer_norm_forget_weight_ptr,
@@ -997,15 +1083,15 @@ inline void LstmStepQuantized(
 
   // Modulation gate.
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      input_ptr, input_to_cell_weight_x_input_zp, input_to_cell_weight_ptr,
+      input_ptr, input_to_cell_effective_bias, input_to_cell_weight_ptr,
       effective_input_to_cell_scale_a, effective_input_to_cell_scale_b, n_batch,
-      n_input, n_cell, 0, scratch_5_ptr, scratch_2_ptr);
+      n_input, n_cell, 0, scratch_5_ptr, scratch_2_ptr, context);
 
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      activation_ptr, recurrent_to_cell_weight_x_activation_zp,
+      activation_ptr, recurrent_to_cell_effective_bias,
       recurrent_to_cell_weight_ptr, effective_recurrent_to_cell_scale_a,
       effective_recurrent_to_cell_scale_b, n_batch, n_output, n_cell, 0,
-      scratch_5_ptr, scratch_2_ptr);
+      scratch_5_ptr, scratch_2_ptr, context);
 
   if (layer_norm_cell_weight_ptr != nullptr) {
     tensor_utils::ApplyLayerNorm(scratch_2_ptr, layer_norm_cell_weight_ptr,
@@ -1018,15 +1104,15 @@ inline void LstmStepQuantized(
 
   // Ouptut gate.
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      input_ptr, input_to_output_weight_x_input_zp, input_to_output_weight_ptr,
+      input_ptr, input_to_output_effective_bias, input_to_output_weight_ptr,
       effective_input_to_output_scale_a, effective_input_to_output_scale_b,
-      n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_3_ptr);
+      n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_3_ptr, context);
 
   tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      activation_ptr, recurrent_to_output_weight_x_activation_zp,
+      activation_ptr, recurrent_to_output_effective_bias,
       recurrent_to_output_weight_ptr, effective_recurrent_to_output_scale_a,
       effective_recurrent_to_output_scale_b, n_batch, n_output, n_cell, 0,
-      scratch_5_ptr, scratch_3_ptr);
+      scratch_5_ptr, scratch_3_ptr, context);
 
   if (layer_norm_output_weight_ptr != nullptr) {
     tensor_utils::ApplyLayerNorm(scratch_3_ptr, layer_norm_output_weight_ptr,
@@ -1038,32 +1124,36 @@ inline void LstmStepQuantized(
   tensor_utils::ApplySigmoid(scratch_3_ptr, n_batch, n_cell, scratch_3_ptr);
 
   // Input gate.
-  tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      input_ptr, input_to_input_weight_x_input_zp, input_to_input_weight_ptr,
-      effective_input_to_input_scale_a, effective_input_to_input_scale_b,
-      n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_0_ptr);
+  if (use_cifg) {
+    tensor_utils::Sub1Vector(scratch_1_ptr, n_batch * n_cell, scratch_0_ptr);
+  } else {
+    tensor_utils::MatrixBatchVectorMultiplyAccumulate(
+        input_ptr, input_to_input_effective_bias, input_to_input_weight_ptr,
+        effective_input_to_input_scale_a, effective_input_to_input_scale_b,
+        n_batch, n_input, n_cell, 0, scratch_5_ptr, scratch_0_ptr, context);
 
-  tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-      activation_ptr, recurrent_to_input_weight_x_activation_zp,
-      recurrent_to_input_weight_ptr, effective_recurrent_to_input_scale_a,
-      effective_recurrent_to_input_scale_b, n_batch, n_output, n_cell, 0,
-      scratch_5_ptr, scratch_0_ptr);
+    tensor_utils::MatrixBatchVectorMultiplyAccumulate(
+        activation_ptr, recurrent_to_input_effective_bias,
+        recurrent_to_input_weight_ptr, effective_recurrent_to_input_scale_a,
+        effective_recurrent_to_input_scale_b, n_batch, n_output, n_cell, 0,
+        scratch_5_ptr, scratch_0_ptr, context);
 
-  if (layer_norm_input_weight_ptr != nullptr) {
-    tensor_utils::ApplyLayerNorm(scratch_0_ptr, layer_norm_input_weight_ptr,
-                                 input_bias_ptr, layer_norm_input_scale_a,
-                                 layer_norm_input_scale_b, inv_large_value[0],
-                                 n_batch, n_cell, scratch_0_ptr);
+    if (layer_norm_input_weight_ptr != nullptr) {
+      tensor_utils::ApplyLayerNorm(scratch_0_ptr, layer_norm_input_weight_ptr,
+                                   input_bias_ptr, layer_norm_input_scale_a,
+                                   layer_norm_input_scale_b, inv_large_value[0],
+                                   n_batch, n_cell, scratch_0_ptr);
+    }
+
+    tensor_utils::ApplySigmoid(scratch_0_ptr, n_batch, n_cell, scratch_0_ptr);
   }
-
-  tensor_utils::ApplySigmoid(scratch_0_ptr, n_batch, n_cell, scratch_0_ptr);
 
   // Cell and hidden.
   tensor_utils::CwiseMul(scratch_1_ptr, cell_ptr, n_batch, n_cell, 15,
                          scratch_1_ptr);
 
-  tensor_utils::CwiseMul(scratch_0_ptr, scratch_2_ptr, n_batch, n_cell, 19,
-                         scratch_2_ptr);
+  tensor_utils::CwiseMul(scratch_0_ptr, scratch_2_ptr, n_batch, n_cell,
+                         30 + cell_scale, scratch_2_ptr);
 
   tensor_utils::CwiseAdd(scratch_1_ptr, scratch_2_ptr, n_batch, n_cell,
                          cell_ptr);
@@ -1072,7 +1162,12 @@ inline void LstmStepQuantized(
     tensor_utils::CwiseClipping(cell_ptr, quantized_cell_clip, n_batch, n_cell);
   }
 
-  tensor_utils::ApplyTanh4(cell_ptr, n_batch, n_cell, scratch_0_ptr);
+  // TODO(jianlijianli): swtich to a tempalte.
+  if (cell_scale == -11) {
+    tensor_utils::ApplyTanh4(cell_ptr, n_batch, n_cell, scratch_0_ptr);
+  } else if (cell_scale == -15) {
+    tensor_utils::ApplyTanh0(cell_ptr, n_batch, n_cell, scratch_0_ptr);
+  }
 
   tensor_utils::CwiseMul(scratch_3_ptr, scratch_0_ptr, effective_hidden_scale_a,
                          effective_hidden_scale_b, n_batch, n_cell, hidden_zp,
@@ -1082,9 +1177,9 @@ inline void LstmStepQuantized(
   if (proj_weight_ptr != nullptr) {
     memset(output_ptr, 0, n_batch * n_output * sizeof(int8_t));
     tensor_utils::MatrixBatchVectorMultiplyAccumulate(
-        scratch_4_ptr, projection_bias_accu, proj_weight_ptr,
+        scratch_4_ptr, projection_effective_bias, proj_weight_ptr,
         effective_proj_scale_a, effective_proj_scale_b, n_batch, n_cell,
-        n_output, activation_zp, scratch_5_ptr, output_ptr);
+        n_output, activation_zp, scratch_5_ptr, output_ptr, context);
   }
 
   if (quantized_proj_clip > 0) {
@@ -1665,7 +1760,7 @@ TfLiteStatus EvalQuantized(
     TfLiteTensor* activation_state, TfLiteTensor* cell_state,
     TfLiteTensor* output, TfLiteTensor* scratch0, TfLiteTensor* scratch1,
     TfLiteTensor* scratch2, TfLiteTensor* scratch3, TfLiteTensor* scratch4,
-    TfLiteTensor* scratch5) {
+    TfLiteTensor* scratch5, CpuBackendContext* context) {
   TF_LITE_ASSERT(input->dims->size >= 2 && input->dims->size <= 3);
   const int n_input = input->dims->data[input->dims->size - 1];
   int max_time, n_batch;
@@ -1795,21 +1890,22 @@ TfLiteStatus EvalQuantized(
         forget_bias_ptr, cell_bias_ptr, output_bias_ptr,
         quantized_lstm_param->quantized_cell_clip,
         quantized_lstm_param->quantized_proj_clip,
+        quantized_lstm_param->cell_scale,
         quantized_lstm_param->inv_large_value.data(),
-        quantized_lstm_param->input_to_forget_weight_x_input_zp.get(),
-        quantized_lstm_param->recurrent_to_forget_weight_x_activation_zp.get(),
-        quantized_lstm_param->input_to_cell_weight_x_input_zp.get(),
-        quantized_lstm_param->recurrent_to_cell_weight_x_activation_zp.get(),
-        quantized_lstm_param->input_to_output_weight_x_input_zp.get(),
-        quantized_lstm_param->recurrent_to_output_weight_x_activation_zp.get(),
-        quantized_lstm_param->input_to_input_weight_x_input_zp.get(),
-        quantized_lstm_param->recurrent_to_input_weight_x_activation_zp.get(),
-        quantized_lstm_param->projection_bias_accu.get(), n_batch, n_cell,
+        quantized_lstm_param->input_to_forget_effective_bias.get(),
+        quantized_lstm_param->recurrent_to_forget_effective_bias.get(),
+        quantized_lstm_param->input_to_cell_effective_bias.get(),
+        quantized_lstm_param->recurrent_to_cell_effective_bias.get(),
+        quantized_lstm_param->input_to_output_effective_bias.get(),
+        quantized_lstm_param->recurrent_to_output_effective_bias.get(),
+        quantized_lstm_param->input_to_input_effective_bias.get(),
+        quantized_lstm_param->recurrent_to_input_effective_bias.get(),
+        quantized_lstm_param->projection_effective_bias.get(), n_batch, n_cell,
         n_input, n_output, output_batch_leading_dim, activation_ptr,
         activation_zp, cell_ptr, output_ptr, GetTensorData<int16_t>(scratch0),
         GetTensorData<int16_t>(scratch1), GetTensorData<int16_t>(scratch2),
         GetTensorData<int16_t>(scratch3), GetTensorData<int8_t>(scratch4),
-        GetTensorData<int32_t>(scratch5));
+        GetTensorData<int32_t>(scratch5), context);
   }
 
   return kTfLiteOk;

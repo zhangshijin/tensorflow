@@ -57,7 +57,14 @@ class SnapshotDatasetTest(reader_dataset_ops_test_base.TFRecordDatasetTestBase,
 
   def assertSnapshotDirectoryContains(
       self, directory, num_fingerprints, num_runs_per_fp, num_snapshot_files):
-    dirlist = os.listdir(directory)
+    dirlist_raw = os.listdir(directory)
+    dirlist = []
+
+    # Ignore the graphdef pbtxts we write for debugging purposes.
+    for i in range(len(dirlist_raw)):
+      if not dirlist_raw[i].endswith("-graph.pbtxt"):
+        dirlist.append(dirlist_raw[i])
+
     self.assertLen(dirlist, num_fingerprints)
 
     for i in range(num_fingerprints):
@@ -133,9 +140,10 @@ class SnapshotDatasetTest(reader_dataset_ops_test_base.TFRecordDatasetTestBase,
   @combinations.generate(
       combinations.times(
           test_base.default_test_combinations(),
-          combinations.combine(
-              compression=[snapshot.COMPRESSION_NONE,
-                           snapshot.COMPRESSION_GZIP])))
+          combinations.combine(compression=[
+              snapshot.COMPRESSION_NONE, snapshot.COMPRESSION_GZIP,
+              snapshot.COMPRESSION_SNAPPY
+          ])))
   def testWriteSnapshotSimpleSuccessful(self, compression):
     tmpdir = self.makeSnapshotDirectory()
 
@@ -159,9 +167,10 @@ class SnapshotDatasetTest(reader_dataset_ops_test_base.TFRecordDatasetTestBase,
   @combinations.generate(
       combinations.times(
           test_base.default_test_combinations(),
-          combinations.combine(
-              compression=[snapshot.COMPRESSION_NONE,
-                           snapshot.COMPRESSION_GZIP])))
+          combinations.combine(compression=[
+              snapshot.COMPRESSION_NONE, snapshot.COMPRESSION_GZIP,
+              snapshot.COMPRESSION_SNAPPY
+          ])))
   def testReadSnapshotBackAfterWrite(self, compression):
     self.setUpTFRecord()
     filenames = self.test_filenames
@@ -187,13 +196,13 @@ class SnapshotDatasetTest(reader_dataset_ops_test_base.TFRecordDatasetTestBase,
 
   @combinations.generate(test_base.default_test_combinations())
   def testReadShuffledSnapshotAfterWrite(self):
-    self.setUpTFRecord(num_files=10, num_records=1000)
+    self.setUpTFRecord(num_files=10, num_records=50)
     filenames = self.test_filenames
 
     expected = [
         b"Record %d of file %d" % (r, f)  # pylint:disable=g-complex-comprehension
         for f in range(0, 10)
-        for r in range(0, 1000)
+        for r in range(0, 50)
     ]
 
     tmpdir = self.makeSnapshotDirectory()
@@ -260,9 +269,10 @@ class SnapshotDatasetTest(reader_dataset_ops_test_base.TFRecordDatasetTestBase,
       combinations.times(
           test_base.default_test_combinations(),
           combinations.times(
-              combinations.combine(
-                  compression=[snapshot.COMPRESSION_NONE,
-                               snapshot.COMPRESSION_GZIP]),
+              combinations.combine(compression=[
+                  snapshot.COMPRESSION_NONE, snapshot.COMPRESSION_GZIP,
+                  snapshot.COMPRESSION_SNAPPY
+              ]),
               combinations.combine(threads=2, size=[1, 2]) +
               combinations.combine(threads=8, size=[1, 4, 8]))))
   def testReadSnapshotBackAfterMultiThreadedWrite(

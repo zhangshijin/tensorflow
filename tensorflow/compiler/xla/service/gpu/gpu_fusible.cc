@@ -42,14 +42,14 @@ void AppendParams(const HloInstruction& instr,
   }
 }
 
-bool CodegensIntoLoop(const HloInstruction& instr) {
+bool IfFusedReadsElementsMultipleTimes(const HloInstruction& instr) {
   CHECK_NE(instr.opcode(), HloOpcode::kFusion) << "`instr` has to be unfused.";
   if (instr.opcode() == HloOpcode::kReduce &&
       !IsReductionFromOrToContiguousDimensions(instr)) {
     return true;
   }
-  // Reduce window codegens into loop only when windows overlap, i.e. stride is
-  // less than window size.
+  // Avoid fusing reduce-window when stride is less than window size to minimize
+  // the number of reads of the same elements.
   if (instr.opcode() == HloOpcode::kReduceWindow) {
     for (const auto& dim : instr.window().dimensions()) {
       if (dim.size() > dim.stride()) {
@@ -120,21 +120,21 @@ bool ShapesCompatibleForMultiOutputFusion(const HloInstruction& instr1,
   // sometimes referred to as "the real hero".
   auto get_real_hero =
       [&](const HloInstruction* instr) -> const HloInstruction* {
-    if (instr->opcode() == HloOpcode::kFusion) {
-      auto fused_expression_root = instr->fused_expression_root();
-      if (instr->IsMultiOutputFusion()) {
-        // If possible, we want to pick a reduction-to-vector operand of the
-        // fusion root, because it has the most constraints.
-        for (const auto* inst : fused_expression_root->operands()) {
-          if (IsReductionFromOrToContiguousDimensions(*inst)) {
-            return inst;
-          }
-        }
-        return fused_expression_root->operands()[0];
-      }
+    if (instr->opcode() != HloOpcode::kFusion) {
+      return instr;
+    }
+    auto fused_expression_root = instr->fused_expression_root();
+    if (!instr->IsMultiOutputFusion()) {
       return fused_expression_root;
     }
-    return instr;
+    // If possible, we want to pick a reduction-to-vector operand of the
+    // fusion root, because it has the most constraints.
+    for (const auto* inst : fused_expression_root->operands()) {
+      if (IsReductionFromOrToContiguousDimensions(*inst)) {
+        return inst;
+      }
+    }
+    return fused_expression_root->operands()[0];
   };
 
   // Multi-output fusion kernels share a common parallel loop. The loop
@@ -162,8 +162,7 @@ bool ShapesCompatibleForMultiOutputFusion(const HloInstruction& instr1,
     return false;
   }
   // The elementwise output shapes must be the same (including layout).
-  // TODO(tjoerg): Further relax the constraint. The datatype does not matter.
-  return ShapeUtil::EqualIgnoringFpPrecision(get_loop_shape(instr_1),
+  return ShapeUtil::EqualIgnoringElementType(get_loop_shape(instr_1),
                                              get_loop_shape(instr_2));
 }
 
@@ -227,6 +226,9 @@ bool IsProducerConsumerFusible(const HloInstruction& producer,
   if (producer.IsMultiOutputFusion()) {
     return false;
   }
+  if (CreatesNestedLoop(producer, consumer)) {
+    return false;
+  }
   // Do not fuse into reduce input fusions if the resulting kernel would suffer
   // from poor data locality (due to unfriendly input layouts).
   if (IsInputFusibleReduction(consumer) &&
@@ -263,6 +265,9 @@ bool IsProducerConsumerMultiOutputFusible(const HloInstruction& producer,
   }
 
   if (!IsLoopFusible(producer) || !IsFusibleAsMultiOutputFusionRoot(consumer)) {
+    return false;
+  }
+  if (CreatesNestedLoop(producer, consumer)) {
     return false;
   }
   if (!ShapesCompatibleForMultiOutputFusion(producer, consumer)) {
@@ -342,10 +347,10 @@ bool CreatesNestedLoop(const HloInstruction& producer,
   // nothing to do.
   auto producer_has_loop_codegen = [&](const HloInstruction& instr) {
     if (producer.opcode() != HloOpcode::kFusion) {
-      return CodegensIntoLoop(producer);
+      return IfFusedReadsElementsMultipleTimes(producer);
     }
     for (const auto& instr : producer.fused_instructions()) {
-      if (CodegensIntoLoop(*instr)) {
+      if (IfFusedReadsElementsMultipleTimes(*instr)) {
         return true;
       }
     }
@@ -358,7 +363,7 @@ bool CreatesNestedLoop(const HloInstruction& producer,
   // If consumer is a non-fusion instruction then we have to check if it
   // generates a loop.
   if (consumer.opcode() != HloOpcode::kFusion) {
-    return CodegensIntoLoop(consumer);
+    return IfFusedReadsElementsMultipleTimes(consumer);
   }
 
   // If consumer is a fusion then we have to check if the output of producer is
@@ -387,7 +392,7 @@ bool CreatesNestedLoop(const HloInstruction& producer,
       }
       visited.insert(cur);
 
-      if (CodegensIntoLoop(*cur)) {
+      if (IfFusedReadsElementsMultipleTimes(*cur)) {
         return true;
       }
       for (const auto& user : cur->users()) {

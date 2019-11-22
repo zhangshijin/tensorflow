@@ -23,6 +23,8 @@ from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import control_flow_util
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.platform import test
 
@@ -39,7 +41,9 @@ class DefFunctionTest(test.TestCase):
 
     inputs = constant_op.constant([1, 2, 2, 3, 3])
     self.assertAllClose([2, 3, 3, 4, 4], func(inputs, 1))
-    self.assertAllClose([2, 3, 3, 4, 4], xla_func(inputs, 1))
+    if not test.is_built_with_rocm():
+      # XLA support is not yet enabled for TF ROCm
+      self.assertAllClose([2, 3, 3, 4, 4], xla_func(inputs, 1))
 
   def testUnsupportedOps(self):
 
@@ -63,18 +67,47 @@ class DefFunctionTest(test.TestCase):
     func = def_function.function(fn, experimental_compile=False)
     xla_func = def_function.function(fn, experimental_compile=True)
 
-    x = constant_op.constant(3.0)
-    with backprop.GradientTape() as tape_1:
-      y_1 = func(x)
-    with backprop.GradientTape() as tape_2:
-      y_2 = xla_func(x)
-    dy_1 = tape_1.gradient(y_1, v)
-    dy_2 = tape_2.gradient(y_2, v)
+    def run_and_check(test_func):
+      x = constant_op.constant(3.0)
+      with backprop.GradientTape() as tape:
+        y = test_func(x)
+      dy = tape.gradient(y, v)
 
-    self.assertAllClose(6.0, y_1)
-    self.assertAllClose(6.0, y_2)
-    self.assertAllClose(3.0, dy_1)
-    self.assertAllClose(3.0, dy_2)
+      self.assertAllClose(6.0, y)
+      self.assertAllClose(3.0, dy)
+
+    run_and_check(func)
+    if not test.is_built_with_rocm():
+      # XLA support is not yet enabled for TF ROCm
+      run_and_check(xla_func)
+
+  def testControlFlow(self):
+
+    @def_function.function(experimental_compile=True)
+    def f(x):
+      assert control_flow_util.GraphOrParentsInXlaContext(
+          ops.get_default_graph())
+      x = ops.convert_to_tensor(x)
+
+      def body(i, a):
+        return i + 1, control_flow_ops.cond(i > 2, lambda: a + (x**2),
+                                            lambda: a + 3)
+
+      return control_flow_ops.while_loop(
+          lambda i, *_: i < 10,
+          body, (constant_op.constant(0), constant_op.constant(3.)),
+          maximum_iterations=10)[1]
+
+    @def_function.function(experimental_compile=True)
+    def g(x):
+      x = ops.convert_to_tensor(x)
+      with backprop.GradientTape() as tape:
+        tape.watch(x)
+        y = f(x)
+      return y, tape.gradient(y, x)
+
+    self.assertAllClose(40.0, f(2.0))
+    self.assertAllClose([40.0, 28.0], g(2.0))
 
 
 if __name__ == '__main__':

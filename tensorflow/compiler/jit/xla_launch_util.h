@@ -23,6 +23,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/xla_tensor.h"
 #include "tensorflow/compiler/tf2xla/xla_compiler.h"
 #include "tensorflow/compiler/xla/client/local_client.h"
+#include "tensorflow/compiler/xla/service/shaped_buffer.h"
 #include "tensorflow/core/framework/allocation_description.pb.h"
 #include "tensorflow/core/framework/resource_var.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -152,7 +153,8 @@ class XlaComputationLaunchContext {
   Status PopulateOutputs(
       OpKernelContext* ctx, const XlaCompiler::CompilationResult* kernel,
       xla::ScopedShapedBuffer output, int missing_ctx_input_prefix,
-      const xla::HloInputOutputAliasConfig& input_output_alias);
+      const xla::HloInputOutputAliasConfig& input_output_alias,
+      const std::map<int, OptionalTensor>& resource_var_snapshots);
 
   // Return the argument list. Only valid after PopulateInputs() has been
   // called.
@@ -190,19 +192,6 @@ class XlaTensorBuffer : public TensorBuffer {
 
   void FillAllocationDescription(AllocationDescription* proto) const override {
     proto->set_allocated_bytes(actual_size_);
-  }
-
-  static Tensor MakeTensor(DataType dtype, const TensorShape& shape,
-                           bool unref_buffer, se::DeviceMemoryBase buffer,
-                           Allocator* allocator) {
-    size_t expected_size = shape.num_elements() * DataTypeSize(dtype);
-    auto* tensor_buffer = new XlaTensorBuffer(buffer.opaque(), expected_size,
-                                              buffer.size(), allocator);
-    Tensor t(dtype, shape, tensor_buffer);
-    if (unref_buffer) {
-      tensor_buffer->Unref();
-    }
-    return t;
   }
 
  private:

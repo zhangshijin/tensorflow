@@ -43,7 +43,7 @@ class FullyConnectedBuffers : public NodeShader {
     const int dst_depth = IntegralDivideRoundUp(attr.weights.shape.o, 4);
 
     // This shader can work with any workgroup size, the values below work well
-    // for OpenGL
+    // for OpenGL.
     constexpr int kWorkgroupHintX = 4;
     constexpr int kWorkgroupHintY = 4;
 
@@ -64,7 +64,7 @@ class FullyConnectedBuffers : public NodeShader {
 
   if (gid.x < $dst_depth$) {
     int offset = 4 * gid.x * $src_depth$ + 4 * tid.y;
-    const int iterations = ($src_depth$ + threads-1) / threads;
+    int iterations = ($src_depth$ + threads-1) / threads;
     for (int d = 0; d < iterations; d++, offset += 4 * threads) {
       vec4 src = $input_data_0[0, 0, d * threads + tid.y]$;
       value_0.x += dot(src, $weights[offset + 0]$);
